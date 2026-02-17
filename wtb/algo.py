@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .indicators import adx, atr, ema
+from .level_engine import refine_plan_for_tactic, validate_plan_levels
 from .structure import recent_range
 
 
@@ -28,9 +29,10 @@ class AlgoPlan:
     distance_pct: float = 0.0  # Added for UX clarity
     distance_atr: float = 0.0  # Added for UX clarity
     distance_direction: str = ""  # Added for UX clarity
+    levels_debug: Optional[Dict[str, object]] = None
 
     def to_dict(self) -> Dict[str, object]:
-        return {
+        d = {
             "symbol": self.symbol,
             "side": self.side,
             "setup_type": self.setup_type,
@@ -50,6 +52,9 @@ class AlgoPlan:
                 "direction": self.distance_direction,
             },
         }
+        if self.levels_debug is not None:
+            d["levels_debug"] = self.levels_debug
+        return d
 
 
 def _pct_spread(bid: float, ask: float) -> float:
@@ -199,6 +204,10 @@ def build_algo_plan(
     adx_period: int = 14,
     late_ok_atr: float = 0.15,
     late_watch_atr: float = 0.25,
+    volume: Optional[np.ndarray] = None,
+    pivot_w: int = 2,
+    bb_period: int = 20,
+    bb_std: float = 2.0,
 ) -> AlgoPlan:
     # basic metrics
     tr = _pct_spread(bid, ask)
@@ -372,6 +381,63 @@ def build_algo_plan(
             tp2 = entry_mid - 2.5 * risk
             tp3 = entry_mid - 3.5 * risk
 
+    # --- Level Engine refinement ---
+    refined = refine_plan_for_tactic(
+        tactic=setup_type,
+        side=side_mode,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        atr_last=atr_last,
+        atr_period=atr_period,
+        rng_low=rng_low,
+        rng_high=rng_high,
+        rng_h=rng_h,
+        existing_entry_low=entry_low,
+        existing_entry_high=entry_high,
+        existing_sl=sl,
+        existing_tps=[tp1, tp2, tp3],
+        pivot_w=pivot_w,
+        bb_period=bb_period,
+        bb_std=bb_std,
+        adx_last=adx_last,
+    )
+
+    entry_low = refined.entry_low
+    entry_high = refined.entry_high
+    sl = refined.stop_loss
+    tp1, tp2, tp3 = refined.take_profits[0], refined.take_profits[1], refined.take_profits[2]
+
+    # --- Validation guards (centralized) ---
+    entry_low, entry_high, sl, [tp1, tp2, tp3], was_repaired, repair_reason = validate_plan_levels(
+        side=side_mode,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        sl=sl,
+        tps=[tp1, tp2, tp3],
+        current_price=current_price,
+    )
+
+    # Update debug with repair info
+    levels_debug_dict = {
+        "tactic": refined.debug.tactic,
+        "avwap_anchor_type": refined.debug.avwap_anchor_type,
+        "avwap_anchor_idx": refined.debug.avwap_anchor_idx,
+        "avwap_status": refined.debug.avwap_status,
+        "chop": refined.debug.chop,
+        "bb_width": refined.debug.bb_width,
+        "magnets_used": refined.debug.magnets_used,
+        "repaired": was_repaired,
+        "repair_reason": repair_reason,
+    }
+    if was_repaired:
+        flags.append("LEVELS_REPAIRED")
+
+    # Recompute entry_mid and risk after refinement
+    entry_mid = (entry_low + entry_high) / 2
+    risk = max(abs(entry_mid - sl), 1e-9)
+
     # Late distance: only counts if price has moved beyond the zone (i.e., chase / missed entry)
     if side_mode == "LONG":
         late_atr = (current_price - entry_high) / atr_last if current_price > entry_high and atr_last else 0.0
@@ -442,4 +508,5 @@ def build_algo_plan(
         distance_pct=float(distance_pct),
         distance_atr=float(distance_atr_units),
         distance_direction=distance_direction,
+        levels_debug=levels_debug_dict,
     )

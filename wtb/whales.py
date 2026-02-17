@@ -118,7 +118,8 @@ def build_whale_context(
             flags=["WHALES_DISABLED"],
         )
 
-    cache_ttl = int(cfg.get("cache_ttl_s", 120))
+    # Cache TTL: check flat key, then nested, then default
+    cache_ttl = int(cfg.get("cache_ttl_s", cfg.get("cache_sec", 120)))
     cached = _cache.get("value")
     cached_ts = _cache.get("ts", 0)
     if cached is not None and (time.time() - cached_ts) < cache_ttl:
@@ -127,8 +128,10 @@ def build_whale_context(
     addresses = [a.strip() for a in cfg.get("addresses", []) if isinstance(a, str) and a.strip()]
     assets = [a.upper() for a in cfg.get("assets", ["BTC", "ETH"]) if isinstance(a, str) and a.strip()]
 
-    base_url = str(cfg.get("base_url", "https://api.hyperliquid.xyz"))
-    timeout_s = int(cfg.get("timeout_s", 12))
+    # Look up base_url and timeout from nested config structures (hyperliquid / api)
+    hl_sub = cfg.get("hyperliquid", cfg.get("api", {}))
+    base_url = str(cfg.get("base_url", hl_sub.get("base_url", "https://api.hyperliquid.xyz")))
+    timeout_s = int(cfg.get("timeout_s", hl_sub.get("timeout_sec", cfg.get("timeout_sec", 12))))
     net_scale = float(cfg.get("net_scale_usd", 50_000_000.0))
 
     if client is None:

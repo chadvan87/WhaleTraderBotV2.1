@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .binance import BinanceFuturesClient
-from .config import load_config
+from .config import deep_merge, load_config
 from .regime import detect_btc_regime
 from .breath import compute_market_breath
 from .indicators import atr, adx
@@ -21,9 +21,32 @@ from .whales import build_whale_context, whales_component_score
 from .plutus import run_plutus_batch
 from .prompts import build_chatgpt_teamlead_prompt
 from .utils import ensure_dir, json_dumps, utc_now_iso, write_text
+from .ui import progress_context
+from .external_intel_providers import build_provider
+from .external_intel import ExternalIntelCache, ExternalIntelBundle, aggregate_external_intel
+from .confidence import heuristic_confidence
 
 
 console = Console()
+
+
+def apply_mode_overrides(cfg: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Apply config overrides for special modes.
+
+    Supported:
+      - NORMAL: no overrides
+      - SCALP: faster TFs + stricter confidence thresholds
+    """
+    mode = str(mode or "NORMAL").upper()
+    if mode != "SCALP":
+        return cfg
+    scalp_cfg = cfg.get("scalp", {})
+    if not bool(scalp_cfg.get("enabled", True)):
+        return cfg
+    overrides = scalp_cfg.get("overrides", {})
+    if not isinstance(overrides, dict):
+        return cfg
+    return deep_merge(cfg, overrides)
 
 
 def prescore_symbol(vol_usdt: float, spread_pct: float, atrp4h: float, adx4h: float) -> float:
@@ -93,6 +116,7 @@ def scan_universe(client: BinanceFuturesClient, cfg: Dict[str, Any], manual_symb
 def run_pipeline(
     cfg_or_path: str | Dict[str, Any],
     side_mode: str,
+    mode: str = "NORMAL",
     manual_symbol: str | None = None,
     insecure_ssl: bool = False,
     enable_plutus: bool = False,
@@ -101,15 +125,22 @@ def run_pipeline(
     print_prompt: bool = False,
 ) -> str | None:
     cfg = load_config(cfg_or_path) if isinstance(cfg_or_path, str) else cfg_or_path
+    cfg = apply_mode_overrides(cfg, mode)
     # CLI override
     if insecure_ssl:
         cfg["binance"]["insecure_ssl"] = True
+
+    ui_cfg = cfg.get("ui", {})
+    progress_enabled = bool(ui_cfg.get("progress", True))
+    refresh = int(ui_cfg.get("refresh_per_second", 20))
 
     client = BinanceFuturesClient(
         base_url=str(cfg["binance"]["base_url"]),
         timeout_sec=int(cfg["binance"]["timeout_sec"]),
         insecure_ssl=bool(cfg["binance"]["insecure_ssl"]),
     )
+
+    console.print(f"Mode: [bold]{mode.upper()}[/bold] | Side: [bold]{side_mode}[/bold]")
 
     console.print("Fetching BTC 1D to detect regime (BTC/USDT)...")
     btc_kl = client.klines("BTCUSDT", interval="1d", limit=250)
@@ -175,81 +206,106 @@ def run_pipeline(
     max_shortlist = int(cfg["scan"]["shortlist_n"])
 
     scored: List[Dict[str, Any]] = []
-    for item in universe:
-        sym = item["symbol"]
-        kl = client.klines(sym, interval=tf, limit=200)
-        if len(kl) < 60:
-            continue
-        high = np.array([float(x[2]) for x in kl], dtype=float)
-        low = np.array([float(x[3]) for x in kl], dtype=float)
-        close = np.array([float(x[4]) for x in kl], dtype=float)
-        atr4_series = atr(high, low, close, int(ind["atr_period"]))
-        adx4_series = adx(high, low, close, int(ind["adx_period"]))
-        if len(atr4_series) == 0 or len(adx4_series) == 0:
-            continue
-        atr4 = float(atr4_series[-1])
-        adx4 = float(adx4_series[-1])
-        atrp4 = atr4 / close[-1] * 100.0
-        pscore = prescore_symbol(item["vol24h_usdt"], item["spread_pct"], float(atrp4), adx4)
-        scored.append({**item, "atrp4h": float(atrp4), "adx4h": adx4, "prescore": float(pscore), "klines_4h": kl})
+    with progress_context(console, enabled=progress_enabled, refresh_per_second=refresh) as prog:
+        task = prog.add_task("Pre-scoring (ATR/ADX)", total=len(universe)) if prog else None
+        for item in universe:
+            sym = item["symbol"]
+            try:
+                kl = client.klines(sym, interval=tf, limit=200)
+            except Exception:
+                if prog and task is not None:
+                    prog.advance(task)
+                continue
+            if len(kl) < 60:
+                if prog and task is not None:
+                    prog.advance(task)
+                continue
+            high = np.array([float(x[2]) for x in kl], dtype=float)
+            low = np.array([float(x[3]) for x in kl], dtype=float)
+            close = np.array([float(x[4]) for x in kl], dtype=float)
+            atr4_series = atr(high, low, close, int(ind["atr_period"]))
+            adx4_series = adx(high, low, close, int(ind["adx_period"]))
+            if len(atr4_series) == 0 or len(adx4_series) == 0:
+                if prog and task is not None:
+                    prog.advance(task)
+                continue
+            atr4 = float(atr4_series[-1])
+            adx4 = float(adx4_series[-1])
+            atrp4 = atr4 / close[-1] * 100.0
+            pscore = prescore_symbol(item["vol24h_usdt"], item["spread_pct"], float(atrp4), adx4)
+            scored.append({**item, "atrp4h": float(atrp4), "adx4h": adx4, "prescore": float(pscore), "klines_4h": kl})
+            if prog and task is not None:
+                prog.advance(task)
 
     scored.sort(key=lambda x: x["prescore"], reverse=True)
     shortlist = scored[:max_shortlist]
 
     # Build algo plans
     late_cfg = cfg.get("scoring", {}).get("late", {})
-    late_ok_atr = float(late_cfg.get("ok_atr", 0.15))
-    late_watch_atr = float(late_cfg.get("watch_atr", 0.25))
+    late_ok_atr = float(late_cfg.get("ok_atr", 0.5))
+    late_watch_atr = float(late_cfg.get("watch_atr", 1.5))
     range_lookback = int(ind.get("range_lookback_bars", ind.get("range_lookback", 48)))
     plans: List[Dict[str, Any]] = []
-    for s in shortlist:
-        kl = s["klines_4h"]
-        open_ = np.array([float(x[1]) for x in kl], dtype=float)
-        high = np.array([float(x[2]) for x in kl], dtype=float)
-        low = np.array([float(x[3]) for x in kl], dtype=float)
-        close = np.array([float(x[4]) for x in kl], dtype=float)
-        current_price = float(close[-1]) if len(close) else float(s["ask"])
-        plan = build_algo_plan(
-            symbol=s["symbol"],
-            side_mode=side_mode,
-            close=close,
-            high=high,
-            low=low,
-            current_price=current_price,
-            bid=float(s["bid"]),
-            ask=float(s["ask"]),
-            volume_usdt=float(s["vol24h_usdt"]),
-            btc_trend=btc_regime.btc_trend,
-            range_lookback=range_lookback,
-            atr_period=int(cfg["indicators"]["atr_period"]),
-            adx_period=int(cfg["indicators"]["adx_period"]),
-            late_ok_atr=late_ok_atr,
-            late_watch_atr=late_watch_atr,
-        )
-        plan_dict = plan.to_dict()
-        plan_dict["late_status"] = plan_dict.get("status_hint")
-        plan_dict["vol24h_usdt"] = float(s.get("vol24h_usdt", 0.0))
-        plan_dict["spread_pct"] = float(s.get("spread_pct", 0.0))
-        plan_dict["atrp4h"] = float(s.get("atrp4h", 0.0))
-        plan_dict["adx4h"] = float(s.get("adx4h", 0.0))
-        plans.append(plan_dict)
+    with progress_context(console, enabled=progress_enabled, refresh_per_second=refresh) as prog:
+        task = prog.add_task("Building ALGO plans", total=len(shortlist)) if prog else None
+        for s in shortlist:
+            kl = s["klines_4h"]
+            high = np.array([float(x[2]) for x in kl], dtype=float)
+            low = np.array([float(x[3]) for x in kl], dtype=float)
+            close = np.array([float(x[4]) for x in kl], dtype=float)
+            volume = np.array([float(x[5]) for x in kl], dtype=float)
+            current_price = float(close[-1]) if len(close) else float(s["ask"])
+            plan = build_algo_plan(
+                symbol=s["symbol"],
+                side_mode=side_mode,
+                close=close,
+                high=high,
+                low=low,
+                current_price=current_price,
+                bid=float(s["bid"]),
+                ask=float(s["ask"]),
+                volume_usdt=float(s["vol24h_usdt"]),
+                btc_trend=btc_regime.btc_trend,
+                range_lookback=range_lookback,
+                atr_period=int(cfg["indicators"]["atr_period"]),
+                adx_period=int(cfg["indicators"]["adx_period"]),
+                late_ok_atr=late_ok_atr,
+                late_watch_atr=late_watch_atr,
+                volume=volume,
+                pivot_w=int(ind.get("pivot_w", 2)),
+                bb_period=int(ind.get("bb_period", 20)),
+                bb_std=float(ind.get("bb_std", 2.0)),
+            )
+            plan_dict = plan.to_dict()
+            plan_dict["late_status"] = plan_dict.get("status_hint")
+            plan_dict["vol24h_usdt"] = float(s.get("vol24h_usdt", 0.0))
+            plan_dict["spread_pct"] = float(s.get("spread_pct", 0.0))
+            plan_dict["atrp4h"] = float(s.get("atrp4h", 0.0))
+            plan_dict["adx4h"] = float(s.get("adx4h", 0.0))
+            plans.append(plan_dict)
+            if prog and task is not None:
+                prog.advance(task)
 
     # Derivatives + orderflow overlays
     if enable_derivatives and bool(cfg.get("derivatives", {}).get("enabled", True)):
         funding_limit = int(cfg.get("derivatives", {}).get("funding_history_limit", 24))
-        for p in plans:
-            try:
-                thresholds = cfg.get("derivatives", {}).get("thresholds", {})
-                snap = get_derivatives_snapshot(
-                    client,
-                    p["symbol"],
-                    side_mode,
-                    funding_history_limit=funding_limit,
-                    thresholds=thresholds,
-                )
-                p["derivatives"] = snap.to_dict()
-            except Exception as e:
-                p["derivatives"] = {"error": str(e)}
+        with progress_context(console, enabled=progress_enabled, refresh_per_second=refresh) as prog:
+            task = prog.add_task("Derivatives snapshot", total=len(plans)) if prog else None
+            for p in plans:
+                try:
+                    thresholds = cfg.get("derivatives", {}).get("thresholds", {})
+                    snap = get_derivatives_snapshot(
+                        client,
+                        p["symbol"],
+                        side_mode,
+                        funding_history_limit=funding_limit,
+                        thresholds=thresholds,
+                    )
+                    p["derivatives"] = snap.to_dict()
+                except Exception as e:
+                    p["derivatives"] = {"error": str(e)}
+                if prog and task is not None:
+                    prog.advance(task)
 
     if enable_orderflow and bool(cfg.get("orderflow", {}).get("enabled", True)):
         now_ms = int(time.time() * 1000)
@@ -257,20 +313,24 @@ def run_pipeline(
         w15 = cfg.get("orderflow", {}).get("window_15m_min", cfg.get("orderflow", {}).get("window_min_15", 15))
         w1h = cfg.get("orderflow", {}).get("window_1h_min", cfg.get("orderflow", {}).get("window_min_60", 60))
         limit = int(cfg.get("orderflow", {}).get("aggtrades_limit", 1000))
-        for p in plans[:top_n]:
-            try:
-                snap = get_orderflow_snapshot(
-                    client,
-                    p["symbol"],
-                    now_ms=now_ms,
-                    insecure_ssl=bool(cfg.get("binance", {}).get("insecure_ssl", False)),
-                    window_15m_min=int(w15),
-                    window_1h_min=int(w1h),
-                    limit=limit,
-                )
-                p["orderflow"] = snap.to_dict()
-            except Exception as e:
-                p["orderflow"] = {"error": str(e)}
+        with progress_context(console, enabled=progress_enabled, refresh_per_second=refresh) as prog:
+            task = prog.add_task("Orderflow snapshot", total=min(top_n, len(plans))) if prog else None
+            for p in plans[:top_n]:
+                try:
+                    snap = get_orderflow_snapshot(
+                        client,
+                        p["symbol"],
+                        now_ms=now_ms,
+                        insecure_ssl=bool(cfg.get("binance", {}).get("insecure_ssl", False)),
+                        window_15m_min=int(w15),
+                        window_1h_min=int(w1h),
+                        limit=limit,
+                    )
+                    p["orderflow"] = snap.to_dict()
+                except Exception as e:
+                    p["orderflow"] = {"error": str(e)}
+                if prog and task is not None:
+                    prog.advance(task)
 
     # Whales scoring overlay (BTC/ETH context only)
     for p in plans:
@@ -310,7 +370,8 @@ def run_pipeline(
     plans.sort(key=lambda x: x["final_score"], reverse=True)
 
     # Optional: Plutus (Ollama) psychology overlay on TOP candidates only
-    plutus_enabled = bool(cfg.get("plutus", {}).get("enabled", False))
+    # Config "enabled: true" is sufficient; CLI --ollama can also force-enable
+    plutus_enabled = bool(cfg.get("plutus", {}).get("enabled", False)) or bool(enable_plutus)
     if plutus_enabled:
         # Only analyze top N candidates (default: 10)
         max_overlay_candidates = int(cfg.get("plutus", {}).get("max_candidates", 10))
@@ -363,6 +424,74 @@ def run_pipeline(
             console.print(f"Ollama overlay error: {e}")
             # Top plans already have ALGO_ONLY defaults from above
 
+    # External intel (Grok/news/onchain/events) on Top-N only
+    ext_cfg = cfg.get("external_intel", {})
+    if bool(ext_cfg.get("enabled", False)):
+        provider = build_provider(cfg)
+        cache_path = str(ext_cfg.get("cache_path", "data/external_intel_cache.json"))
+        ttl = int(ext_cfg.get("ttl_sec", 1800))
+        cache = ExternalIntelCache(cache_path, ttl_sec=ttl)
+        weights = ext_cfg.get("weights", {"sentiment": 0.40, "onchain": 0.35, "events": 0.25})
+        top_n_ext = int(ext_cfg.get("top_n", 5))
+
+        console.print(f"Fetching external intel via provider=[bold]{provider.name()}[/bold] (top {min(top_n_ext, len(plans))})...")
+        with progress_context(console, enabled=progress_enabled, refresh_per_second=refresh) as prog:
+            task = prog.add_task("External intel", total=min(top_n_ext, len(plans))) if prog else None
+            for p in plans[:top_n_ext]:
+                key = f"{provider.name()}:{p['symbol']}"
+                cached = cache.get(key)
+                try:
+                    if cached and all(k in cached for k in ("sentiment", "onchain", "events", "action", "multiplier", "score")):
+                        bundle = ExternalIntelBundle(
+                            provider=str(cached.get("provider", provider.name())),
+                            sentiment=dict(cached.get("sentiment", {})),
+                            onchain=dict(cached.get("onchain", {})),
+                            events=dict(cached.get("events", {})),
+                            score=float(cached.get("score", 0.0)),
+                            action=str(cached.get("action", "proceed")),
+                            multiplier=float(cached.get("multiplier", 1.0)),
+                        )
+                    else:
+                        ctx = {
+                            "side_mode": side_mode,
+                            "mode": mode,
+                            "btc_regime": btc_regime.to_dict() if btc_regime else {},
+                            "setup_type": p.get("setup_type"),
+                            "final_score": float(p.get("final_score", 0.0)),
+                            "derivatives": p.get("derivatives", {}),
+                        }
+                        sent = provider.fetch_sentiment(p["symbol"], ctx)
+                        onc = provider.fetch_onchain(p["symbol"], ctx)
+                        ev = provider.fetch_events(p["symbol"], ctx)
+                        s, action, mult = aggregate_external_intel(sent, onc, ev, weights=weights)
+                        bundle = ExternalIntelBundle(
+                            provider=provider.name(),
+                            sentiment=sent,
+                            onchain=onc,
+                            events=ev,
+                            score=float(s),
+                            action=str(action),
+                            multiplier=float(mult),
+                        )
+                        cache.set(key, bundle.to_dict())
+                    p["external_intel"] = bundle.to_dict()
+                except Exception as e:
+                    p["external_intel"] = {"provider": provider.name(), "error": str(e), "action": "proceed", "multiplier": 1.0, "score": 0.0}
+                if prog and task is not None:
+                    prog.advance(task)
+
+        try:
+            cache.save()
+        except Exception:
+            pass
+
+    # Confidence gate (cheap heuristic for now)
+    for p in plans:
+        try:
+            p["confidence"] = heuristic_confidence(p, cfg).to_dict()
+        except Exception as e:
+            p["confidence"] = {"score": float(p.get("final_score", 0.0)), "label": "WATCH", "reasons": [f"confidence_error:{e}"]}
+
     # Watchlist selection
     min_score = float(cfg["scan"]["min_watch_score"])
     watch_k = int(cfg["scan"]["watchlist_k"])
@@ -372,12 +501,18 @@ def run_pipeline(
         min_score = max(min_score, float(cfg.get("breath", {}).get("min_watch_score_risk_off", 75)))
         watch_k = max(1, int(round(watch_k * 0.5)))
 
-    candidates = [p for p in plans if p["final_score"] >= min_score]
+    candidates = [
+        p
+        for p in plans
+        if p["final_score"] >= min_score and str((p.get("confidence") or {}).get("label", "WATCH")) != "SKIP"
+    ]
     candidates.sort(key=lambda x: x["final_score"], reverse=True)
     if not candidates and plans:
         # Keep algo-only output useful even if scores are low.
         plans_sorted = sorted(plans, key=lambda x: x.get("final_score", 0.0), reverse=True)
-        candidates = plans_sorted[: max(1, watch_k)]
+        # Prefer non-SKIP first
+        non_skip = [p for p in plans_sorted if str((p.get("confidence") or {}).get("label", "WATCH")) != "SKIP"]
+        candidates = (non_skip or plans_sorted)[: max(1, watch_k)]
         for p in candidates:
             flags = list(p.get("flags", []))
             if "MIN_SCORE_BYPASS" not in flags:
@@ -413,6 +548,12 @@ def run_pipeline(
     chatgpt_prompt = build_chatgpt_teamlead_prompt(payload)
     write_text(str(latest / "chatgpt_prompt.txt"), chatgpt_prompt)
 
+    if print_prompt:
+        console.print("\n" + "=" * 60)
+        console.print("ChatGPT Prompt:")
+        console.print("=" * 60)
+        console.print(chatgpt_prompt)
+
     console.print(f"Saved outputs to {latest.resolve()}")
     return str(latest.resolve())
 
@@ -422,7 +563,15 @@ def _watchlist_text(watchlist: List[Dict[str, Any]], side_mode: str) -> str:
     lines.append(f"WATCHLIST (side_mode={side_mode})")
     lines.append("")
     for i, w in enumerate(watchlist, 1):
-        lines.append(f"[{i}] {w['symbol']} {w['side']} | score={w['final_score']:.1f} | setup={w['setup_type']}")
+        conf = w.get("confidence") or {}
+        conf_score = float(conf.get("score", w.get("final_score", 0.0)))
+        conf_label = str(conf.get("label", "WATCH"))
+        ext = w.get("external_intel") or {}
+        ext_action = str(ext.get("action", "-"))
+        ext_mult = float(ext.get("multiplier", 1.0))
+        lines.append(
+            f"[{i}] {w['symbol']} {w['side']} | score={w['final_score']:.1f} | conf={conf_score:.0f} ({conf_label}) | ext={ext_action} (x{ext_mult:.2f}) | setup={w['setup_type']}"
+        )
         lines.append(f"Entry: {w['entry_zone']} | SL: {w['stop_loss']} | TP: {w['take_profits']}")
         lines.append(f"ExpectedR(tp2): {w['expected_r']:.2f} | Late: {w['late_status']} (late_atr={w['late_atr']:.2f})")
         if w.get("derivatives"):
@@ -493,8 +642,8 @@ def _default_confirm(plan: Dict[str, Any]) -> List[str]:
     return base[:4]
 
 
-def _final_score(plan: Dict[str, Any], cfg: Dict[str, Any]) -> float:
-    return float(_score_breakdown(plan, cfg)[0])
+def _final_score(plan: Dict[str, Any], btc_regime, breath, cfg: Dict[str, Any]) -> float:
+    return float(_score_breakdown(plan, btc_regime, breath, cfg)[0])
 
 
 
@@ -555,10 +704,13 @@ def _score_breakdown(plan: Dict[str, Any], btc_regime, breath, cfg: Dict[str, An
 
     penalties = 0.0
 
-    # Late/no-chase penalties
+    # Late/no-chase penalties (per-status, configurable)
     late_status = plan.get("late_status")
-    if late_status in ("WATCH_LATE", "WATCH_PULLBACK"):
-        penalties += float(scoring_cfg.get("late_penalty", -4.0))
+    late_sub = scoring_cfg.get("late", {})
+    if late_status == "WATCH_LATE":
+        penalties += float(late_sub.get("penalty_watch_late", scoring_cfg.get("late_penalty", -2.0)))
+    elif late_status == "WATCH_PULLBACK":
+        penalties += float(late_sub.get("penalty_watch_pullback", 0.0))
 
     # BTC regime headwind
     if btc_regime:
@@ -608,26 +760,43 @@ def _render_table(items: List[Dict[str, Any]], side_mode: str) -> None:
     table.add_column("#", justify="right")
     table.add_column("Symbol")
     table.add_column("Score", justify="right")
+    table.add_column("Conf", justify="right")
+    table.add_column("Decision")
+    table.add_column("Ext")
+    table.add_column("Mult", justify="right")
     table.add_column("Vol24h(USDT)", justify="right")
     table.add_column("Spread%", justify="right")
     table.add_column("ATR%4H", justify="right")
     table.add_column("ADX4H", justify="right")
     table.add_column("Setup")
+    table.add_column("Late")
     table.add_column("Flags")
 
     for idx, it in enumerate(items, 1):
         flags = it.get("flags", [])
         if it.get("overlay_flags"):
             flags = list(flags) + list(it.get("overlay_flags", []))
+        conf = it.get("confidence") or {}
+        conf_score = float(conf.get("score", it.get("final_score", 0.0)))
+        conf_label = str(conf.get("label", "WATCH"))
+        decision = "EXECUTE" if conf_label == "EXECUTE" else "WATCH" if conf_label == "WATCH" else "SKIP"
+        ext = it.get("external_intel") or {}
+        ext_action = str(ext.get("action", "-"))
+        ext_mult = float(ext.get("multiplier", 1.0))
         table.add_row(
             str(idx),
             str(it.get("symbol")),
             f"{it.get('final_score', 0):.1f}",
+            f"{conf_score:.0f}",
+            decision,
+            ext_action,
+            f"{ext_mult:.2f}",
             f"{it.get('vol24h_usdt', 0):.0f}",
             f"{it.get('spread_pct', 0):.2f}",
             f"{it.get('atrp4h', 0):.2f}",
             f"{it.get('adx4h', 0):.2f}",
             str(it.get("setup_type")),
+            str(it.get("late_status", "")),
             ",".join(flags[:6]),
         )
 

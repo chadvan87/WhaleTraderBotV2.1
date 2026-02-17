@@ -34,6 +34,7 @@ from .plutus import run_plutus_batch
 from .prompts import build_chatgpt_teamlead_prompt
 from .utils import ensure_dir, json_dumps, utc_now_iso, write_text
 from .pipeline import prescore_symbol, _default_confirm, _score_breakdown, _render_table
+from .confidence import heuristic_confidence
 
 import pathlib
 
@@ -262,8 +263,8 @@ def run_manual_pipeline(
 
     # ========== BUILD ALGO PLANS ==========
     late_cfg = cfg.get("scoring", {}).get("late", {})
-    late_ok_atr = float(late_cfg.get("ok_atr", 0.15))
-    late_watch_atr = float(late_cfg.get("watch_atr", 0.25))
+    late_ok_atr = float(late_cfg.get("ok_atr", 0.5))
+    late_watch_atr = float(late_cfg.get("watch_atr", 1.5))
     range_lookback = int(ind.get("range_lookback_bars", ind.get("range_lookback", 48)))
 
     plans: List[Dict[str, Any]] = []
@@ -427,6 +428,13 @@ def run_manual_pipeline(
         except Exception as e:
             console.print(f"Ollama overlay error: {e}")
 
+    # ========== CONFIDENCE GATE ==========
+    for p in plans:
+        try:
+            p["confidence"] = heuristic_confidence(p, cfg).to_dict()
+        except Exception as e:
+            p["confidence"] = {"score": float(p.get("final_score", 0.0)), "label": "WATCH", "reasons": [f"confidence_error:{e}"]}
+
     # ========== WATCHLIST SELECTION ==========
     min_score = float(cfg["scan"]["min_watch_score"])
     watch_k = int(cfg["scan"]["watchlist_k"])
@@ -436,13 +444,17 @@ def run_manual_pipeline(
         min_score = max(min_score, float(cfg.get("breath", {}).get("min_watch_score_risk_off", 75)))
         watch_k = max(1, int(round(watch_k * 0.5)))
 
-    candidates = [p for p in plans if p["final_score"] >= min_score]
+    candidates = [
+        p for p in plans
+        if p["final_score"] >= min_score and str((p.get("confidence") or {}).get("label", "WATCH")) != "SKIP"
+    ]
     candidates.sort(key=lambda x: x["final_score"], reverse=True)
 
     if not candidates and plans:
         # Keep output useful even if scores are low
         plans_sorted = sorted(plans, key=lambda x: x.get("final_score", 0.0), reverse=True)
-        candidates = plans_sorted[:max(1, watch_k)]
+        non_skip = [p for p in plans_sorted if str((p.get("confidence") or {}).get("label", "WATCH")) != "SKIP"]
+        candidates = (non_skip or plans_sorted)[:max(1, watch_k)]
         for p in candidates:
             flags = list(p.get("flags", []))
             if "MIN_SCORE_BYPASS" not in flags:

@@ -65,7 +65,7 @@ def compute_dynamic_exit(
     current = float(closes[-1])
 
     a = atr(highs, lows, closes, 14)
-    atr4h = float(a) if a is not None else float(np.nan)
+    atr4h = float(a[-1]) if len(a) > 0 else float(np.nan)
 
     tp1 = float(take_profits[0]) if take_profits else float("nan")
     risk = abs(entry - stop_loss)

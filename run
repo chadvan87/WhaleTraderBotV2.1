@@ -2,4 +2,11 @@
 set -euo pipefail
 
 # Short wrapper so you can type: ./run long --top 120
-python3 whaletraderbot.py "$@"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Use venv python if available, otherwise system python3
+if [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    "$SCRIPT_DIR/.venv/bin/python3" "$SCRIPT_DIR/whaletraderbot.py" "$@"
+else
+    python3 "$SCRIPT_DIR/whaletraderbot.py" "$@"
+fi

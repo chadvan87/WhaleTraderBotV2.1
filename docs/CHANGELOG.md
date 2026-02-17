@@ -1,6 +1,81 @@
 # CHANGELOG - WhaleTraderBot v2.3 ALGO-only Audit & Fixes
 
-**Date**: 2026-01-11
+---
+
+## Audit #2 — 2026-02-13
+
+**Auditor**: Claude Code (Opus 4.6 — Senior Python Engineer + Crypto Trading Systems Reviewer)
+
+### Bugs Fixed
+
+#### 1. `wtb/utils.py` — Duplicate function definitions + broken RateLimiter
+
+**Issue**: 5 functions defined twice (`json_default`, `json_dumps`, `read_text`, `write_text`, `extract_json_from_text`). Python silently uses the last definition, making the first definitions dead code. Additionally, `RateLimiter.begin()` and `RateLimiter.elapsed()` referenced `self.start` which doesn't exist on the dataclass (copy-paste from `Timer` class) — would crash if called.
+
+**Fix**: Removed all duplicate definitions (kept the more robust second versions). Removed broken `begin()` and `elapsed()` methods from `RateLimiter`.
+
+#### 2. `wtb/pipeline.py` — Late penalty treats WATCH_LATE and WATCH_PULLBACK identically
+
+**Issue**: `_score_breakdown()` applied the same penalty for both `WATCH_LATE` (price moved past entry — chasing) and `WATCH_PULLBACK` (price extended, need pullback). The `default_config()` defines separate penalties: `penalty_watch_late: -2.0` and `penalty_watch_pullback: 0.0`, but the code read a single `late_penalty` key.
+
+**Fix**: Read per-status penalty from `scoring.late.penalty_watch_late` and `scoring.late.penalty_watch_pullback`. WATCH_PULLBACK (waiting for pullback) now correctly has 0 penalty by default, while WATCH_LATE (chasing) gets -2.0.
+
+#### 3. `wtb/pipeline.py` + `wtb/manual.py` — Late ATR fallback defaults mismatch
+
+**Issue**: Inline fallback defaults were `ok_atr=0.15, watch_atr=0.25` but `default_config()` defines `ok_atr=0.5, watch_atr=1.5`. The tight fallbacks (0.15 ATR) would flag nearly every trade as LATE. While `load_config()` always provides the correct values from `default_config()`, the inconsistency was confusing and error-prone.
+
+**Fix**: Changed inline fallbacks to match `default_config()`: `ok_atr=0.5, watch_atr=1.5`.
+
+#### 4. `wtb/manual.py` — Missing confidence gate
+
+**Issue**: Manual mode never called `heuristic_confidence()`, so plans lacked a `confidence` field. The table rendering (`_render_table`) expects `p.get("confidence")` — without it, all manual-mode entries showed as WATCH with score 0. SKIP filtering was also missing.
+
+**Fix**: Added `heuristic_confidence()` call after scoring, and added SKIP filtering to candidate selection (matching scan mode behavior).
+
+#### 5. `wtb/whales.py` — Config key path mismatch for Hyperliquid settings
+
+**Issue**: `build_whale_context()` read flat keys (`cfg.get("base_url")`, `cfg.get("timeout_s")`, `cfg.get("cache_ttl_s")`) but configs store them nested: `default_config()` uses `whales.hyperliquid.base_url` + `whales.hyperliquid.timeout_sec` + `whales.cache_sec`, and `config.example.json` uses `whales.api.base_url`. Result: configured values were always ignored, only hardcoded fallbacks were used.
+
+**Fix**: Added nested key lookups: checks `hyperliquid` sub-dict, then `api` sub-dict, then flat key, then fallback. Also reads `cache_sec` as alternate key for TTL.
+
+#### 6. `wtb/confidence.py` — OI_FLUSH incorrectly penalized (-3.0)
+
+**Issue**: `derivatives.py` scores OI_FLUSH as +1.0 (constructive — liquidation clears crowded positions, aligns with sweep/reclaim philosophy). But `confidence.py` penalized it -3.0. This contradicts the strategy spec: OI flush = liquidation event = opportunity for reclaim entries.
+
+**Fix**: Changed OI_FLUSH from -3.0 penalty to +1.0 boost. Reason label changed to `oi_flush_constructive`.
+
+#### 7. `wtb/manage.py` — `atr()` returns array, code expected scalar
+
+**Issue**: `atr(highs, lows, closes, 14)` returns a numpy array, but `float(a)` was called directly. This would raise `TypeError: only length-1 arrays can be converted to Python scalars` on any array with >1 element.
+
+**Fix**: Changed to `float(a[-1])` with length check.
+
+#### 8. `config.example.json` — Late ATR thresholds unreasonably tight
+
+**Issue**: `ok_atr: 0.15, watch_atr: 0.25` means being just 0.15 ATR away from the entry zone edge triggers WATCH_LATE. At 4H ATR, this is a few dollars on most alts — practically every trade would be flagged. The `default_config()` uses `0.5 / 1.5` which is sensible.
+
+**Fix**: Updated to `ok_atr: 0.5, watch_atr: 1.5`. Also added the per-status penalty keys (`penalty_watch_late: -2`, `penalty_watch_pullback: 0`) and aligned `late_penalty` to -2 (was -4).
+
+### Tests Added
+
+Added 4 new smoke tests in `wtb/tests_smoke.py`:
+
+1. **`test_scoring_weight_normalization`** — Verifies weights sum to 100, keys match expected set, whales weight = 5 (spec).
+2. **`test_late_penalty_differentiation`** — Verifies WATCH_PULLBACK has less severe penalty than WATCH_LATE, and `max_penalty_abs` = 10 (spec).
+3. **`test_confidence_oi_flush_not_penalized`** — Verifies OI_FLUSH does not reduce confidence score below base.
+4. **`test_setup_type_all_four`** — Regression test ensuring all 4 setup types remain producible.
+
+### Verification
+
+- All 27 `.py` files pass `py_compile`.
+- All smoke tests pass (`python3 -m wtb.tests_smoke`).
+- No new dependencies added.
+- All JSON schema fields preserved (backward compatible).
+
+---
+
+## Audit #1 — 2026-01-11
+
 **Auditor**: Claude Code (Senior Python Engineer + Crypto Trading Systems Reviewer)
 
 ---

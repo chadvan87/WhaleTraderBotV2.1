@@ -18,6 +18,10 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 def default_config() -> Dict[str, Any]:
     # Keep defaults aligned with config.example.json
     return {
+        "ui": {
+            "progress": True,
+            "refresh_per_second": 20,
+        },
         "binance": {
             "base_url": "https://fapi.binance.com",
             "timeout_sec": 15,
@@ -94,6 +98,43 @@ def default_config() -> Dict[str, Any]:
             "keep_latest": 5,
             "compact_prompt": True,
         },
+        "external_intel": {
+            "enabled": False,
+            "provider": "mock",  # mock | http
+            "top_n": 5,
+            "ttl_sec": 1800,
+            "weights": {"sentiment": 0.40, "onchain": 0.35, "events": 0.25},
+            "cache_path": "data/external_intel_cache.json",
+            "http": {
+                "sentiment_url": None,
+                "onchain_url": None,
+                "events_url": None,
+                "timeout_sec": 30,
+            },
+        },
+        "confidence": {
+            "enabled": True,
+            "min_execute": 75,
+            "min_watch": 65,
+            "late_penalty": 5.0,
+            "apply_external_multiplier": True,
+        },
+        "scalp": {
+            "enabled": True,
+            "overrides": {
+                # faster TFs for scalp-style watchlists
+                "scan": {
+                    "scan_top": 80,
+                    "shortlist_n": 25,
+                    "watchlist_k": 8,
+                    "min_watch_score": 65,
+                    "timeframes": {"context": "4h", "execution": "15m", "refine": "5m"},
+                },
+                "confidence": {"min_execute": 80, "min_watch": 70},
+                "external_intel": {"top_n": 3},
+                "plutus": {"max_candidates": 6},
+            },
+        },
         "backtest": {
             "enabled": False,
             "cache_dir": "data_cache",
@@ -125,6 +166,33 @@ def default_config() -> Dict[str, Any]:
         "manual": {
             "enabled": True,
             "default_symbols": ["BTCUSDT", "ETHUSDT"],
+        },
+        "dca": {
+            "side_default": "LONG",
+            "scan_top": 180,
+            "watchlist_k": 15,
+            "min_dca_score": 55,
+            "explore_quota": 0.2,
+            "timeframe": "4h",
+            "tiers": {
+                "core": {"min_volume_usdt": 500_000_000, "max_spread_pct": 0.08},
+                "mid": {"min_volume_usdt": 100_000_000, "max_spread_pct": 0.15},
+                "explore": {"min_volume_usdt": 25_000_000, "max_spread_pct": 0.30},
+            },
+            "weights": {
+                "microstructure": 30,
+                "mean_reversion": 25,
+                "volatility_fit": 20,
+                "derivatives_health": 15,
+                "context": 10,
+            },
+            "penalties": {
+                "btc_headwind": 6,
+                "extreme_funding": 4,
+                "liquidity_stress": 4,
+                "trend_runaway": 5,
+                "max_total": 15,
+            },
         },
     }
 

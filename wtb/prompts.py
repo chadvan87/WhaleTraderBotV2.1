@@ -39,7 +39,8 @@ def build_chatgpt_teamlead_prompt(payload: Dict[str, Any]) -> str:
         "Goal: Choose 0–3 EXECUTE trades from WATCHLIST. Refine Entry/SL/TP and output Cornix-ready messages for EXECUTE.\n"
         "Rules: NO hallucination. If data is missing, mark WATCH/SKIP.\n\n"
         "IMPORTANT: ALGO provided deterministic Entry/SL/TP (always present).\n"
-        "Local LLM overlay (if present) is advisory only (psych + confirm checklist).\n\n"
+        "Local LLM overlay (if present) is advisory only (psych + confirm checklist).\n"
+        "External intel (if present) is advisory only (sentiment/onchain/events + multiplier).\n\n"
         "=== INPUT JSON (copy) ===\n"
         f"{json_dumps(payload, pretty=True)}\n"
     )
